@@ -12,6 +12,8 @@
 #include "index_options.h"
 #include "hotring_namespace.h"
 
+// #define DEBUG
+
 using LEGOKV_NAMESPACE::Status;
 using LEGOKV_NAMESPACE::Slice;
 using LEGOKV_NAMESPACE::Options;
@@ -59,14 +61,6 @@ struct item_t {
   tag_key_t Key() {
     tag_key_t tag_key(tag, key);
     return tag_key;
-  }
-  item_t& operator*() const {
-    std::cout << "access *" << std::endl;
-    return *(reinterpret_cast<item_t*>(reinterpret_cast<uintptr_t>(this) & 0xffffffffffff));
-  }
-  item_t* operator->() const {
-    std::cout << "access ->" << std::endl;
-    return reinterpret_cast<item_t*>(reinterpret_cast<uintptr_t>(this) & 0xffffffffffff);
   }
   item_t* GetRaw() const {
     return reinterpret_cast<item_t*>(reinterpret_cast<uintptr_t>(this) & 0xffffffffffff);
@@ -157,6 +151,7 @@ struct head_ptr_t {
 
   inline void SetActive() { ptr |= ((uintptr_t)1 << 63); }
   inline void UnsetActive() { ptr &= ~((uintptr_t)1 << 63); }
+  inline bool IsActive() {return (ptr >> 63) & 1;}
   
   void UpdateCounter() {
     int cnt = (((1 << 15) - 1) & (ptr >> 48));
@@ -195,35 +190,6 @@ public:
     delete head_ptr->GetRaw();
   }
 
-  // Requires lock-free guard.
-  // class RingIterator {
-  //   public:
-  //     RingIterator() : cur_item_ptr(nullptr), prev_item_ptr(nullptr) {}
-  //     RingIterator(item_t* ptr) : prev_item_ptr(nullptr) {
-  //       cur_item_ptr = ptr;
-  //     }
-  //     tag_key_t Key() {
-  //       return cur_item_ptr->Key();
-  //     }
-  //     bool Valid() {
-  //       return cur_item_ptr != nullptr;
-  //     }
-  //     void Next() {
-  //       if(prev_item_ptr == nullptr) prev_item_ptr = cur_item_ptr;
-  //       else prev_item_ptr = prev_item_ptr->next_item_ptr;
-  //       cur_item_ptr = cur_item_ptr->next_item_ptr;
-  //     }
-  //     item_t* GetPrev() {
-  //       return prev_item_ptr;
-  //     }
-  //     item_t* GetCur() {
-  //       return cur_item_ptr;
-  //     }
-  //   private:
-  //     item_t* cur_item_ptr;
-  //     item_t* prev_item_ptr;
-  // };
-
   class RingIterator {
     public:
       RingIterator() : cur_item_ptr(0), prev_item_ptr(0) {}
@@ -242,8 +208,6 @@ public:
         return cur_item_ptr != nullptr;
       }
       void Next() {
-        // if(prev_item_ptr == nullptr) prev_item_ptr = cur_item_ptr;
-        // else prev_item_ptr = prev_item_ptr->GetRaw()->next_item_ptr.load();
         prev_item_ptr = prev_item_ptr->GetRaw()->next_item_ptr.load();
         cur_item_ptr = cur_item_ptr->GetRaw()->next_item_ptr.load();
       }
@@ -265,8 +229,29 @@ public:
     RecordTick(stat_, HOTRING_LOOKUP_TIME);
     assert(head_ptr->GetRaw() != nullptr);
 
-    // if during a sampling process, track record
+    // update request count in one of the following conditions:
+    //  1) when using random shift policy.
+    //  2) when using sampling shift policy, and there's no ongoing sampling process.
+    if(opts_->use_random_shift || (opts_->use_sampling_shift && !head_ptr->IsActive())) {
+    #ifdef DEBUG
+      std::cout << "request + 1" << std::endl;
+    #endif
+      request_count_.fetch_add(1);
+    }
+
+    // determine whether to start a sampling process
     if(opts_->use_sampling_shift) {
+      if(request_count_.load() == opts_->R && !head_ptr->IsActive()) {
+        head_ptr->SetActive(); // trigger sampling shift by setting active flag on head_ptr.
+        sampling_size.store(size_.load());  // set the sampling period to be the size of the ring.
+      #ifdef DEBUG
+        std::cout << "start sampling for " << sampling_size.load() << " times" << std::endl;
+      #endif
+      }
+    }
+
+    // if during a sampling process, update head_ptr counter
+    if(opts_->use_sampling_shift && head_ptr->IsActive()) {
       head_ptr->UpdateCounter();
     }
 
@@ -275,22 +260,27 @@ public:
       if(iter.Key() == key) {
         value = iter.GetCur()->GetRaw()->value;
         if(opts_->use_random_shift) {
-          if(request_count_.fetch_add(1) == opts_->R && head_ptr->GetRaw() != iter.GetCur()) {
+          if(request_count_.load() == opts_->R && head_ptr->GetRaw() != iter.GetCur()) {
             // trigger a random head_ptr shift
             RecordTick(stat_, HOTRING_RANDOM_HEAD_SHIFT);
             head_ptr->SetRaw(iter.GetCur());
             request_count_.store(0);
           }
-        } else if(opts_->use_sampling_shift) {
+        } else if(opts_->use_sampling_shift && head_ptr->IsActive()) {
         #ifdef DEBUG
           std::cout << "trigger sampling" << std::endl;
         #endif
           IncCounter(iter.GetPrev()->GetRaw()->next_item_ptr);
-          if(request_count_.fetch_add(1) == opts_->R) {
+          sampling_size.fetch_sub(1);
+          if(sampling_size.load() == 0 && head_ptr->GetRaw() != iter.GetCur()) {
             RecordTick(stat_, HOTRING_SAMPLING_HEAD_SHIFT);
             // trigger a sampling shift
             SamplingShift();    
             request_count_.store(0);
+            head_ptr->UnsetActive();
+          #ifdef DEBUG
+            std::cout << "end sampling" << std::endl;
+          #endif
           }
         }
         return true;
@@ -317,6 +307,7 @@ public:
       head_ptr->SetRaw(item);
       assert(head_ptr->GetRaw() != nullptr);
       item->next_item_ptr = item;
+      size_.fetch_add(1);
       return;
     }
 
@@ -337,16 +328,7 @@ public:
         success = true;
       }
     }
-    // if(head_ptr->Empty()) {
-    //   head_ptr->SetRaw(item);
-    //   assert(head_ptr->GetRaw() != nullptr);
-    //   item->next_item_ptr = item;
-    // } else {
-    //   item_t* target = FindLessThan(key);
-    //   assert(target != nullptr);
-    //   item->next_item_ptr = target->next_item_ptr;
-    //   target->next_item_ptr = item;
-    // }
+    size_.fetch_add(1);
   }
 
   void Show() {
@@ -368,6 +350,7 @@ private:
   IndexOptions* opts_;
   std::atomic<uint32_t> request_count_ = {0};
   std::atomic<uint32_t> size_ = {0};
+  std::atomic<uint32_t> sampling_size = {0};
   LocalStatistics* stat_;
   // Find the last key that's less than or equal to key.
   item_t* FindLessThan(const tag_key_t key) {
@@ -401,29 +384,20 @@ private:
   void SamplingShift() {
   #ifdef DEBUG
     std::cout << "start sampling shift" << std::endl;
+    std::cout << "total: " << size_.load() << std::endl;
   #endif
-    // count total item in a ring
-    int total = 0;
-    item_t* dummy = head_ptr->GetRaw();
-    assert(dummy != nullptr);
-    do {
-      ++total;
-      dummy = dummy->next_item_ptr.load()->GetRaw();
-    } while(dummy != head_ptr->GetRaw());
-  #ifdef DEBUG
-    std::cout << "total: " << total << std::endl;
-  #endif
+    int total = size_.load();
 
     std::vector<double> incomes(total, 0.0);
-    RingIterator iter(head_ptr->GetRaw());
     
     for(int i = 1; i <= total; ++i) {
+      RingIterator iter(head_ptr->GetRaw());
       for(int iter_loc = 1; iter_loc <= total; iter.Next(), iter_loc++) {
-      #ifdef DEBUG
-        if(i == 1) std::cout << "key: " << iter.GetCur()->GetRaw()->Key() << ", counter: " << GetCounterWeak(iter.GetCur()) << "," << head_ptr->GetCounter() << std::endl;
-      #endif
         double ratio = (double)GetCounterWeak(iter.GetCur()) / head_ptr->GetCounter();
         double local_income = ratio * (abs(iter_loc - i) % total);
+      #ifdef DEBUG
+        if(i == 2) std::cout << "key: " << iter.GetCur()->GetRaw()->Key() << ", counter: " << GetCounterWeak(iter.GetCur()) << "," << head_ptr->GetCounter() << std::endl;
+      #endif
         incomes[i - 1] += local_income;
       }
     }
@@ -434,7 +408,7 @@ private:
   #endif
     for(size_t i = 0; i < incomes.size(); ++i) {
     #ifdef DEBUG
-      std::cout << incomes[i] << std::endl;
+      std::cout << (double)incomes[i] << std::endl;
     #endif
       if(incomes[i] < min_income) {
         min_income = incomes[i];

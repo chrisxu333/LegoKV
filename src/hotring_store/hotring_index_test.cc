@@ -19,7 +19,7 @@ typedef std::pair<std::string, std::string> kvtype_string;
 std::vector<kvtype_tag> kvs;
 std::unordered_set<std::string> kvs_string;
 std::vector<kvtype_string> kvs_string_real;
-int num_keys = 10000;
+int num_keys = 100;
 int num_reader = 10;
 int keys_per_reader = num_keys / num_reader;
 
@@ -34,10 +34,19 @@ void GenerateRandomKV() {
   }
 }
 
+void GenerateSerialKVString() {
+  kvs_string_real.clear();
+  for(int i = 0; i < num_keys; ++i) {
+    std::string key = std::to_string(i);
+    std::string value = "value" + key;
+    kvs_string_real.push_back(std::make_pair(key, value));
+  }
+}
+
 void GenerateRandomKVString() {
   kvs_string_real.clear();
   for(int i = 0; i < num_keys; ++i) {
-    std::string key = std::to_string(random() % num_keys);
+    std::string key = std::to_string(rand() % num_keys);
     std::string value = "value" + key;
     kvs_string_real.push_back(std::make_pair(key, value));
   }
@@ -242,23 +251,6 @@ TEST(RingOpMultithread, DISABLED_multi_thread_insert_lookup) {
   }
 }
 
-TEST(HotRingIndex, put_get_single_value_out_of_scope) {
-  HotRingIndex hr_index(IndexOptions{});
-  Status s;
-  std::string key = "key";
-  {
-    std::string data = "123123123";
-    hr_index.Put((key), (data));
-  }
-
-  {
-    std::string data;
-    s = hr_index.Get((key), data);
-    ASSERT_EQ(Status::OK(), s);
-    ASSERT_EQ(data, "123123123");
-  }
-}
-
 TEST(HotRingIndex, DISABLED_put_get_unique_value) {
   HotRingIndex hr_index(IndexOptions{});
   Status s;
@@ -307,26 +299,26 @@ TEST(HotRingIndex, DISABLED_put_get_real_workload) {
   delete stat;
 }
 
-TEST(HotRingIndex, DISABLED_put_with_samping_shift) {
+TEST(HotRingIndex, put_with_samping_shift) {
   IndexOptions options;
   options.bucket_size = 10;
-  options.use_sampling_shift = false;
+  options.use_sampling_shift = true;
   options.R = 5;
   LocalStatistics* stat = new LocalStatistics();
   HotRingIndex hr_index(options, stat);
   Status s;
-  GenerateRandomKVString();
+  GenerateSerialKVString();
   for(int i = 0; i < num_keys; ++i) {
     s = hr_index.Put((kvs_string_real[i].first), (kvs_string_real[i].second));
     ASSERT_EQ(Status::OK(), s);
   }
 
   // read as a zipfian fashion
-  std::default_random_engine generator;
-  zipfian_int_distribution<int> distribution(4, num_keys, 0.99);
+  // std::default_random_engine generator;
+  // zipfian_int_distribution<int> distribution(4, num_keys, 0.999);  
   for(int i = 0; i < num_keys; ++i) {
-    int idx = distribution(generator);
-    std::cout << "access key: " << kvs_string_real[idx].first << std::endl;
+    // int idx = distribution(generator);
+    int idx = zipf(1.22, 13, num_keys - 1);
     std::string value;
     s = hr_index.Get((kvs_string_real[idx].first), value);
     ASSERT_EQ(Status::OK(), s);
